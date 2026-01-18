@@ -355,7 +355,14 @@ def ocr_image(img: np.ndarray) -> Tuple[str, float]:
     pil_img = Image.fromarray(img)
     data = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DATAFRAME)
     text = "\n".join([str(t) for t in data["text"].fillna("") if str(t).strip()])
-    confs = [c for c in data.get("conf", []).tolist() if isinstance(c, (int, float)) and c >= 0]
+    confs: List[float] = []
+    for c in data.get("conf", []).tolist():
+        try:
+            cf = float(c)
+            if cf >= 0:
+                confs.append(cf)
+        except Exception:
+            continue
     avg_conf = float(np.mean(confs)) if confs else 0.0
     return text, avg_conf
 
@@ -641,7 +648,7 @@ def process_one_image(
     comments = f"avg_conf={conf:.1f}; path={drive_rel_path}"
 
     row = Row(
-        FILE_NAME=local_path.name,
+        FILE_NAME=drive_rel_path,
         COUNTRY=country,
         STATE=state,
         LOCATION=location,
