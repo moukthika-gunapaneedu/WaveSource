@@ -1,59 +1,80 @@
 #!/usr/bin/env python3
 """
-Tsunami Marigram OCR → Excel
--------------------------------------------------
+WaveSource — Google Drive Marigram OCR -> Excel (Human-in-the-loop)
+==================================================================
+
 What this script does
- 1) OCR marigram (tide‑gauge) images using Tesseract + OpenCV
- 2) Parse key metadata (COUNTRY, STATE, LOCATION, DATE, SCALE)
- 3) Geocode LAT/LON online from COUNTRY/STATE/LOCATION using OpenStreetMap Nominatim
- 4) Write/append structured rows to an Excel workbook 
+1) Pull marigram images from Google Drive folders (recursively)
+2) OCR each image (Tesseract + OpenCV preprocessing variants)
+3) Parse key fields (COUNTRY / STATE / LOCATION / RECORDED_DATE / SCALE)
+4) Validate (but DO NOT guess) against NOAA descriptor allow-lists:
+   - COUNTRY: https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/countries
+   - STATE:   https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/states
+   - LOCATION:https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/locations (paginated)
+5) REGION_CODE (NCEI region code) is strict:
+   - Only accept if explicit 2-digit code is found in OCR text AND exists in NOAA regions list:
+     https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/regions
+6) LOCATION_SHORT (IOC station code) is strict:
+   - Scraped from IOC station list page and resolved by exact (COUNTRY, LOCATION) match:
+     https://www.ioc-sealevelmonitoring.org/list.php
+   - If not found: leave blank (human fills)
+7) Optional: geocode LAT/LON from (LOCATION, STATE, COUNTRY) using Nominatim
+8) Human-in-the-loop review:
+   - If a field is missing or fails allow-list matching, we get a quick CLI prompt to accept/edit
+9) Append structured rows to Excel (.xlsx), and keep a progress log so it can be resumed
 
-Rules
-- Region codes: ONLY the official IOC list in this file or your --region-map CSV.
-- Country/State/Location: If not in the allow-lists you provide, keep the OCR text and let the geocoder resolve it (no guessing beyond that).
-- LAT/LON: Numeric decimals from geocoding. Do NOT scrape degrees/letters from the image.
-- RECORDED_DATE: Normalized to YYYY/MM/DD from whatever the image shows.
-- SCALE: Reads 1/12, 1:12, SCALE 1/12, etc. Normalized to `1:NN`.
+Install (pip)
+  pip install opencv-python pillow pytesseract pandas openpyxl numpy requests beautifulsoup4 \
+              google-api-python-client google-auth-httplib2 google-auth-oauthlib geopy
 
-Usage (examples):
-  python marigram_ocr_to_excel_geocode.py \
-      --images /path/to/marigrams \
+System deps
+  - Tesseract binary installed and on PATH
+
+Google Drive Auth
+  - Create OAuth Client credentials (Desktop) in Google Cloud Console
+  - Save as ./credentials.json
+  - First run creates ./token.json after browser auth
+
+Usage
+  python drive_marigram_hitl_to_excel.py \
+      --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> \
       --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
-      --save-ocr ./ocr_texts \
-      --region-map ./ioc_region_codes.csv \
-      --country-list ./countries.txt \
-      --state-list ./states.txt \
-      --location-list ./locations.txt
-
-Minimal:
-  python marigram_ocr_to_excel_geocode.py --images ./marigrams --out-xlsx ./out.xlsx
-
-Pip deps:
-  opencv-python pillow pytesseract pandas openpyxl numpy geopy
-System deps:
-  - Tesseract binary (Ubuntu: `sudo apt-get install tesseract-ocr`; macOS: `brew install tesseract`).
-
-Notes:
-  - Best‑effort parsing; anything uncertain is left blank for review.
-  - The script never invents IOC region codes; they must appear in the text or CSV.
+      --microfilm-name-from-folder \
+      --save-ocr ./_ocr_audit \
+      --cache-dir ./_drive_cache \
+      --resume \
+      --enable-geocode
 """
 
 from __future__ import annotations
+
 import argparse
-import csv
+import io
+import json
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
-from PIL import Image
 import pytesseract  # type: ignore
+import requests  # type: ignore
+from PIL import Image  # type: ignore
+from bs4 import BeautifulSoup  # type: ignore
 
-# Geocoding
+# Google Drive API
+from googleapiclient.discovery import build  # type: ignore
+from googleapiclient.http import MediaIoBaseDownload  # type: ignore
+from google.oauth2.credentials import Credentials  # type: ignore
+from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+from google.auth.transport.requests import Request  # type: ignore
+
+# geocoding
 try:
     from geopy.geocoders import Nominatim  # type: ignore
     from geopy.extra.rate_limiter import RateLimiter  # type: ignore
@@ -61,8 +82,9 @@ except Exception:
     Nominatim = None
     RateLimiter = None
 
+
 # ---------------------------
-# Columns
+# Output columns
 # ---------------------------
 DEFAULT_COLUMNS = [
     "FILE_NAME", "COUNTRY", "STATE", "LOCATION", "LOCATION_SHORT", "REGION_CODE",
@@ -71,33 +93,15 @@ DEFAULT_COLUMNS = [
 ]
 
 # ---------------------------
-# IOC Region Codes (exact list you approved)
+# NOAA descriptor endpoints
 # ---------------------------
-IOC_REGION_CODES = {
-    "30": "Red Sea and Persian Gulf",
-    "40": "Black Sea and Caspian Sea",
-    "50": "Mediterranean Sea",
-    "60": "Indian Ocean (including W. Australia and W. Indonesia)",
-    "70": "Southeast Atlantic Ocean",
-    "71": "Southwest Atlantic Ocean",
-    "72": "Northwest Atlantic Ocean",
-    "73": "Northeast Atlantic Ocean",
-    "74": "Caribbean Sea and Bermuda",
-    "75": "East Coast of United States and Canada",
-    "76": "Gulf of America/Mexico",
-    "77": "West Coast of Africa",
-    "78": "Central Africa",
-    "80": "Hawaii, Johnston Atoll, Midway I",
-    "81": "E. Australia, New Zealand, South Pacific Is.",
-    "82": "New Caledonia, New Guinea, Solomon Is., Vanuatu",
-    "83": "E. Indonesia and Malaysia",
-    "84": "China, North and South Korea, Philippines, Taiwan",
-    "85": "Japan",
-    "86": "Kamchatka and Kuril Islands",
-    "87": "Alaska (including Aleutian Islands)",
-    "88": "West Coast of North and Central America",
-    "89": "West Coast of South America",
-}
+NOAA_COUNTRIES_URL = "https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/countries?itemsPerPage=200&page=1"
+NOAA_STATES_URL    = "https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/states?itemsPerPage=200&page=1"
+NOAA_REGIONS_URL   = "https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/regions?itemsPerPage=200&page=1"
+NOAA_LOCATIONS_URL = "https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/locations?itemsPerPage=200&page={page}"
+
+# IOC station list (LOCATION_SHORT)
+IOC_LIST_URL = "https://www.ioc-sealevelmonitoring.org/list.php"
 
 # ---------------------------
 # Regexes
@@ -107,16 +111,23 @@ DATE_PATTERNS = [
     re.compile(r"(?<!\d)(?P<m>0?[1-9]|1[0-2])[\-/](?P<d>0?[1-9]|[12]\d|3[01])[\-/](?P<y>19\d{2}|20\d{2})(?!\d)"),
     re.compile(r"(?<!\w)(?P<d>0?[1-9]|[12]\d|3[01])\s+(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+(?P<y>19\d{2}|20\d{2})(?!\w)", re.I),
 ]
-MONTH_MAP = { 'JAN':'01','FEB':'02','MAR':'03','APR':'04','MAY':'05','JUN':'06','JUL':'07','AUG':'08','SEP':'09','SEPT':'09','OCT':'10','NOV':'11','DEC':'12' }
+MONTH_MAP = {'JAN':'01','FEB':'02','MAR':'03','APR':'04','MAY':'05','JUN':'06','JUL':'07','AUG':'08','SEP':'09','SEPT':'09','OCT':'10','NOV':'11','DEC':'12'}
 
-SCALE_PATTERNS = [  # 1/12, 1:12, SCALE 1/12 → 1:12
+SCALE_PATTERNS = [
     re.compile(r"(?:SCALE\s*[:=]?\s*)?1\s*[:/]\s*(?P<den>\d{1,4})", re.I),
 ]
 
-UPPER_TRIPLE_SPLIT = re.compile(r"^([A-Z][A-Z\- .'()&/]+?)\s{2,}([A-Z][A-Z\- .'()&/]+?)\s{2,}([A-Z0-9][A-Z0-9\- .,'()&/]+)$")
+# UPPERCASE triple split on 2+ spaces
+UPPER_TRIPLE_SPLIT = re.compile(
+    r"^([A-Z][A-Z\- .'()&/]+?)\s{2,}([A-Z][A-Z\- .'()&/]+?)\s{2,}([A-Z0-9][A-Z0-9\- .,'()&/]+)$"
+)
+
+# Strict IOC code appearance (4-5 usually, allow 3-6 to be safe)
+IOC_CODE_RE = re.compile(r"^[A-Za-z0-9]{3,6}$")
+
 
 # ---------------------------
-# Data structures
+# Data model
 # ---------------------------
 @dataclass
 class Row:
@@ -138,48 +149,190 @@ class Row:
     MICROFILM_NAME: str = ""
     COMMENTS: str = ""
 
+
 # ---------------------------
-# IO helpers
+# Small utils
 # ---------------------------
+def _upper(s: str) -> str:
+    return (s or "").strip().upper()
 
-def read_list(path: Optional[str]) -> List[str]:
-    if not path:
-        return []
-    vals: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s:
-                vals.append(s.upper())
-    return vals
+def sanitize_text(text: str) -> str:
+    text = text.replace("\x0c", " ")
+    text = re.sub(r"[\u200b\u200c\u200d]", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text
+
+def safe_filename(name: str) -> str:
+    name = re.sub(r"[^\w.\- ]+", "_", name)
+    return name.strip() or "file"
+
+def ensure_excel(path: str) -> None:
+    p = Path(path)
+    if not p.exists():
+        pd.DataFrame(columns=DEFAULT_COLUMNS).to_excel(path, index=False)
+
+def append_rows_to_excel(path: str, rows: List[Row]) -> None:
+    ensure_excel(path)
+    existing = pd.read_excel(path)
+    for col in DEFAULT_COLUMNS:
+        if col not in existing.columns:
+            existing[col] = ""
+    new_df = pd.DataFrame([asdict(r) for r in rows], columns=DEFAULT_COLUMNS)
+    out = pd.concat([existing, new_df], ignore_index=True)
+    out.to_excel(path, index=False)
 
 
-def read_region_map(path: Optional[str]) -> Dict[str, str]:
-    if not path:
-        return IOC_REGION_CODES.copy()
-    mapping: Dict[str, str] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        _ = next(reader, None)
-        for row in reader:
-            if len(row) < 2:
-                continue
-            code = row[0].strip()
-            desc = row[1].strip()
-            if code and desc:
-                mapping[code] = desc
-    return mapping
+# ---------------------------
+# NOAA allow-lists + region map
+# ---------------------------
+def _fetch_json(url: str, timeout: int = 30) -> dict:
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_noaa_lists() -> Tuple[Set[str], Set[str], Set[str], Dict[str, str]]:
+    """
+    Returns:
+      countries_set, states_set, locations_set, regions_map(code->description)
+    """
+    countries_j = _fetch_json(NOAA_COUNTRIES_URL)
+    states_j    = _fetch_json(NOAA_STATES_URL)
+    regions_j   = _fetch_json(NOAA_REGIONS_URL)
+
+    countries = {_upper(x["description"]) for x in countries_j.get("items", [])}
+    states    = {_upper(x["description"]) for x in states_j.get("items", [])}
+    regions   = {str(x["id"]).strip(): str(x["description"]).strip() for x in regions_j.get("items", [])}
+
+    # Locations are paginated (397 -> 2 pages today, but do not assume)
+    page1 = _fetch_json(NOAA_LOCATIONS_URL.format(page=1))
+    total_pages = int(page1.get("totalPages", 1))
+    locations: Set[str] = {_upper(x["description"]) for x in page1.get("items", [])}
+    for p in range(2, total_pages + 1):
+        jp = _fetch_json(NOAA_LOCATIONS_URL.format(page=p))
+        locations |= {_upper(x["description"]) for x in jp.get("items", [])}
+
+    return countries, states, locations, regions
+
+def validate_against_allow_list(value: str, allow: Set[str]) -> Tuple[str, bool]:
+    """
+    Returns (kept_value, needs_review).
+    - If exact upper-case match exists in allow-list => returns normalized UPPER value, needs_review=False
+    - Else keep OCR text as-is (no guessing), needs_review=True
+    """
+    if not value or not value.strip():
+        return "", True
+    v = _upper(value)
+    if v in allow:
+        return v, False
+    return value.strip(), True
+
+def parse_region_code_strict(ocr_text: str, regions_map: Dict[str, str]) -> Tuple[str, bool]:
+    """
+    Strict: accept only explicit 2-digit code present in text AND exists in NOAA regions list.
+    """
+    if not ocr_text:
+        return "", True
+
+    # [85]
+    m = re.search(r"\[(\d{2})\]", ocr_text)
+    if m and m.group(1) in regions_map:
+        return m.group(1), False
+
+    # REGION: 85 / REGION 85
+    m = re.search(r"\bREGION\b[^0-9]*(\d{2})\b", ocr_text, re.I)
+    if m and m.group(1) in regions_map:
+        return m.group(1), False
+
+    # LOCATION_SHORT: 85
+    m = re.search(r"\b(?:LOCATION_SHORT|LOC\.?\s*SHORT)\b[^0-9]*(\d{2})\b", ocr_text, re.I)
+    if m and m.group(1) in regions_map:
+        return m.group(1), False
+
+    return "", True
+
+
+# ---------------------------
+# IOC station code index (LOCATION_SHORT)
+# ---------------------------
+def fetch_ioc_station_index(timeout: int = 30) -> Dict[Tuple[str, str], str]:
+    """
+    Scrape IOC list.php to build:
+      (COUNTRY_UPPER, LOCATION_UPPER) -> IOC_CODE
+    If IOC markup changes, you may need to adjust the table/header detection.
+    """
+    html = requests.get(IOC_LIST_URL, timeout=timeout).text
+    soup = BeautifulSoup(html, "html.parser")
+
+    tables = soup.find_all("table")
+    target = None
+    headers: List[str] = []
+
+    for t in tables:
+        ths = t.find_all("th")
+        if not ths:
+            continue
+        header_text = " ".join(_upper(th.get_text(" ", strip=True)) for th in ths)
+        if "CODE" in header_text and "COUNTRY" in header_text and "LOCATION" in header_text:
+            target = t
+            headers = [_upper(th.get_text(" ", strip=True)) for th in ths]
+            break
+
+    if target is None:
+        raise RuntimeError("Could not find IOC station list table. IOC page markup may have changed.")
+
+    def idx(name: str) -> int:
+        for i, h in enumerate(headers):
+            if h == name:
+                return i
+        for i, h in enumerate(headers):
+            if name in h:
+                return i
+        raise RuntimeError(f"Could not locate IOC column: {name}")
+
+    i_code = idx("CODE")
+    i_country = idx("COUNTRY")
+    i_location = idx("LOCATION")
+
+    index: Dict[Tuple[str, str], str] = {}
+    for tr in target.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds or len(tds) <= max(i_code, i_country, i_location):
+            continue
+
+        code = tds[i_code].get_text(" ", strip=True).strip()
+        country = tds[i_country].get_text(" ", strip=True).strip()
+        location = tds[i_location].get_text(" ", strip=True).strip()
+
+        if not code:
+            continue
+        key = (_upper(country), _upper(location))
+        if key not in index:
+            index[key] = code
+
+    return index
+
+def resolve_location_short_strict(country: str, location: str, ioc_index: Dict[Tuple[str, str], str]) -> Tuple[str, bool]:
+    """
+    Strict resolver:
+      exact (COUNTRY, LOCATION) match -> IOC code
+    else blank for human review.
+    """
+    if not country or not location:
+        return "", True
+    code = ioc_index.get((_upper(country), _upper(location)), "")
+    if code and IOC_CODE_RE.match(code):
+        return code, False
+    return "", True
+
 
 # ---------------------------
 # OCR pipeline
 # ---------------------------
-
-def load_image(path: str) -> np.ndarray:
+def load_image_cv(path: str) -> np.ndarray:
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"Failed to read image: {path}")
     return img
-
 
 def preprocess_variants(img: np.ndarray) -> List[np.ndarray]:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -193,7 +346,6 @@ def preprocess_variants(img: np.ndarray) -> List[np.ndarray]:
     _, th3 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(th3)
     return out
 
-
 def ocr_image(img: np.ndarray) -> Tuple[str, float]:
     config = "--psm 6 --oem 3"
     pil_img = Image.fromarray(img)
@@ -203,41 +355,37 @@ def ocr_image(img: np.ndarray) -> Tuple[str, float]:
     avg_conf = float(np.mean(confs)) if confs else 0.0
     return text, avg_conf
 
-
 def best_ocr_from_variants(img: np.ndarray) -> Tuple[str, float, np.ndarray]:
-    best_text = ""; best_conf = -1.0; best_variant = img
+    best_text = ""
+    best_conf = -1.0
+    best_variant = img
     for var in preprocess_variants(img):
         text, conf = ocr_image(var)
         if conf > best_conf or (conf == best_conf and len(text) > len(best_text)):
             best_text, best_conf, best_variant = text, conf, var
     return best_text, best_conf, best_variant
 
+
 # ---------------------------
-# Parsing helpers
+# Parsing helpers (COUNTRY/STATE/LOCATION/DATE/SCALE)
 # ---------------------------
-
-def sanitize_text(text: str) -> str:
-    text = text.replace("\x0c", " ")
-    text = re.sub(r"[\u200b\u200c\u200d]", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
-
-
-def parse_country_state_location(lines: List[str], countries: List[str], states: List[str]) -> Tuple[str, str, str]:
+def parse_country_state_location(lines: List[str]) -> Tuple[str, str, str]:
     # A) UPPERCASE triple with 2+ spaces
     for line in lines[:15]:
         m = UPPER_TRIPLE_SPLIT.match(line.strip())
         if m:
             return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+
     # B) Semicolon/comma triplets
     for line in lines[:20]:
         parts = re.split(r"\s*[;,\t]\s*", line.strip())
         if len(parts) >= 3:
             a, b, c = parts[0], parts[1], parts[2]
-            if a.upper() in countries or a.isupper():
-                return a.strip(), b.strip(), c.strip()
+            # do NOT guess; just return the parts
+            return a.strip(), b.strip(), c.strip()
+
     # C) Explicit labels
-    blob = "\n".join(lines[:50])
+    blob = "\n".join(lines[:60])
     m = re.search(r"COUNTRY[:\-\s]+([A-Z .,'()&/-]+)", blob, re.I)
     country = m.group(1).strip() if m else ""
     m = re.search(r"STATE[:\-\s]+([A-Z0-9 .,'()&/-]+)", blob, re.I)
@@ -245,7 +393,6 @@ def parse_country_state_location(lines: List[str], countries: List[str], states:
     m = re.search(r"LOCATION[:\-\s]+([A-Z0-9 .,'()&/-]+)", blob, re.I)
     location = m.group(1).strip() if m else ""
     return country, state, location
-
 
 def normalize_date_to_ymd(text: str) -> str:
     for pat in DATE_PATTERNS:
@@ -256,7 +403,7 @@ def normalize_date_to_ymd(text: str) -> str:
         if 'mon' in gd and gd['mon']:
             y = gd['y']; d = gd['d'].zfill(2)
             mon = gd['mon'].upper()[:4].replace('.', '')
-            mm = MONTH_MAP.get(mon[:3], '')
+            mm = MONTH_MAP.get(mon[:4], MONTH_MAP.get(mon[:3], ""))
             if y and mm and d:
                 return f"{y}/{mm}/{d}"
         else:
@@ -265,7 +412,6 @@ def normalize_date_to_ymd(text: str) -> str:
                 return f"{y}/{mm.zfill(2)}/{d.zfill(2)}"
     return ""
 
-
 def parse_scale(text: str) -> str:
     for pat in SCALE_PATTERNS:
         m = pat.search(text)
@@ -273,18 +419,20 @@ def parse_scale(text: str) -> str:
             return f"1:{m.group('den')}"
     return ""
 
-# ---------------------------
-# Geocoding
-# ---------------------------
 
-def make_geocoder() -> Optional[RateLimiter]:
-    if Nominatim is None:
+# ---------------------------
+# geocoding
+# ---------------------------
+def make_geocoder(enable: bool) -> Optional["RateLimiter"]:
+    if not enable:
         return None
-    geolocator = Nominatim(user_agent="marigram_geocoder")
+    if Nominatim is None or RateLimiter is None:
+        print("Geocoding requested but geopy is not available. Install geopy or disable --enable-geocode.")
+        return None
+    geolocator = Nominatim(user_agent="wavesource_marigram_geocoder")
     return RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
 
-
-def geocode_latlon(country: str, state: str, location: str, geocode_fn: Optional[RateLimiter]) -> Tuple[str, str]:
+def geocode_latlon(country: str, state: str, location: str, geocode_fn: Optional["RateLimiter"]) -> Tuple[str, str]:
     if geocode_fn is None:
         return "", ""
     queries: List[str] = []
@@ -296,148 +444,366 @@ def geocode_latlon(country: str, state: str, location: str, geocode_fn: Optional
         queries.append(f"{state}, {country}")
     if country:
         queries.append(country)
+
     for q in queries:
         try:
             loc = geocode_fn(q)
-            if loc and getattr(loc, 'latitude', None) is not None and getattr(loc, 'longitude', None) is not None:
+            if loc and getattr(loc, "latitude", None) is not None and getattr(loc, "longitude", None) is not None:
                 return f"{float(loc.latitude):.5f}", f"{float(loc.longitude):.5f}"
         except Exception:
             continue
     return "", ""
 
-# ---------------------------
-# Main processing
-# ---------------------------
 
-def process_image(path: str,
-                  region_map: Dict[str, str],
-                  countries: List[str],
-                  states: List[str],
-                  locations: List[str],
-                  save_ocr_dir: Optional[Path],
-                  geocode_fn: Optional[RateLimiter]) -> Row:
-    img = load_image(path)
-    text, conf, best_variant = best_ocr_from_variants(img)
+# ---------------------------
+# Google Drive helpers
+# ---------------------------
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+def drive_service() -> object:
+    creds: Optional[Credentials] = None
+    token_path = Path("token.json")
+    cred_path = Path("credentials.json")
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not cred_path.exists():
+                raise RuntimeError("Missing credentials.json. Create OAuth client credentials and save as credentials.json.")
+            flow = InstalledAppFlow.from_client_secrets_file(str(cred_path), SCOPES)
+            creds = flow.run_local_server(port=0)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+
+    return build("drive", "v3", credentials=creds)
+
+def drive_list_children(svc: object, folder_id: str) -> List[dict]:
+    """List direct children of a folder (files + subfolders)"""
+    items: List[dict] = []
+    page_token = None
+    while True:
+        resp = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+            pageSize=1000
+        ).execute()
+        items.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+def drive_get_path_map(svc: object, folder_ids: List[str]) -> Dict[str, str]:
+    """
+    Traverse folders and build a map:
+      file_id -> "Folder/Subfolder/filename.ext"
+    """
+    out: Dict[str, str] = {}
+    stack: List[Tuple[str, str]] = [(fid, "") for fid in folder_ids]
+
+    while stack:
+        fid, prefix = stack.pop()
+        children = drive_list_children(svc, fid)
+        for it in children:
+            name = it["name"]
+            mime = it["mimeType"]
+            it_id = it["id"]
+            if mime == "application/vnd.google-apps.folder":
+                stack.append((it_id, f"{prefix}{name}/"))
+            else:
+                out[it_id] = f"{prefix}{name}"
+    return out
+
+def drive_download_file(svc: object, file_id: str, dest_path: Path) -> None:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    request = svc.files().get_media(fileId=file_id)
+    fh = io.FileIO(str(dest_path), "wb")
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+def is_image_name(name: str) -> bool:
+    ext = Path(name).suffix.lower()
+    return ext in {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp"}
+
+
+# ---------------------------
+# Human-in-the-loop review UI (CLI)
+# ---------------------------
+def prompt_field(label: str, current: str, needs_review: bool, allow_hint: str = "") -> str:
+    """
+    Simple interactive prompt:
+    - If needs_review: highlight with '!!'
+    - Press Enter to keep current
+    - Or type new value
+    """
+    flag = "!!" if needs_review else "  "
+    hint = f" ({allow_hint})" if allow_hint else ""
+    print(f"{flag} {label}{hint}: {current!r}")
+    inp = input("    -> Enter to accept, or type correction: ").strip()
+    return current if inp == "" else inp
+
+def prompt_yes_no(msg: str, default_yes: bool = True) -> bool:
+    d = "Y/n" if default_yes else "y/N"
+    inp = input(f"{msg} [{d}]: ").strip().lower()
+    if inp == "":
+        return default_yes
+    return inp in {"y", "yes"}
+
+
+# ---------------------------
+# Progress log (resume)
+# ---------------------------
+def load_processed_ids(log_path: Path) -> Set[str]:
+    if not log_path.exists():
+        return set()
+    done: Set[str] = set()
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            obj = json.loads(line)
+            if "file_id" in obj and obj.get("status") == "ok":
+                done.add(str(obj["file_id"]))
+        except Exception:
+            continue
+    return done
+
+def append_log(log_path: Path, record: dict) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ---------------------------
+# Core processing for one image
+# ---------------------------
+def process_one_image(
+    local_path: Path,
+    drive_rel_path: str,
+    countries: Set[str],
+    states: Set[str],
+    locations: Set[str],
+    regions_map: Dict[str, str],
+    ioc_index: Dict[Tuple[str, str], str],
+    geocode_fn: Optional["RateLimiter"],
+    save_ocr_dir: Optional[Path],
+    microfilm_name: str,
+    microfilm_from_folder: bool,
+    interactive: bool,
+) -> Row:
+    img = load_image_cv(str(local_path))
+    ocr_text, conf, best_variant = best_ocr_from_variants(img)
 
     if save_ocr_dir:
         save_ocr_dir.mkdir(parents=True, exist_ok=True)
-        (save_ocr_dir / (Path(path).stem + ".txt")).write_text(text, encoding="utf-8")
-        cv2.imwrite(str(save_ocr_dir / (Path(path).stem + "_bin.png")), best_variant)
+        stem = safe_filename(local_path.stem)
+        (save_ocr_dir / f"{stem}.txt").write_text(ocr_text, encoding="utf-8")
+        cv2.imwrite(str(save_ocr_dir / f"{stem}_best.png"), best_variant)
 
-    text_clean = sanitize_text(text)
+    text_clean = sanitize_text(ocr_text)
     lines = [ln.strip() for ln in text_clean.splitlines() if ln.strip()]
 
-    country, state, location = parse_country_state_location(lines, countries, states)
-
-    # Keep OCR values even if not in lists; rely on geocoder to resolve
-    # (if not in list, refer to internet to find it.)
-
-    date = normalize_date_to_ymd(text_clean)
+    # Parse OCR candidates
+    country_ocr, state_ocr, location_ocr = parse_country_state_location(lines)
+    recorded_date = normalize_date_to_ymd(text_clean)
     scale = parse_scale(text_clean)
 
-    # Geocode for numeric lat/lon
+    # Validate vs NOAA allow-lists (no guessing; keep OCR but flag)
+    country, country_flag = validate_against_allow_list(country_ocr, countries)
+    state, state_flag = validate_against_allow_list(state_ocr, states)
+    location, location_flag = validate_against_allow_list(location_ocr, locations)
+
+    # Region code strict
+    region_code, region_flag = parse_region_code_strict(text_clean, regions_map)
+
+    # IOC station code strict (LOCATION_SHORT)
+    location_short, loc_short_flag = resolve_location_short_strict(country, location, ioc_index)
+
+    # Lat/lon (geocode)
     lat, lon = geocode_latlon(country, state, location, geocode_fn)
 
-    # REGION_CODE: strict — only accept if explicit code appears and is in mapping
-    loc_short = "UNKNOWN"
-    region_code = "UNKNOWN"
-    m = re.search(r"\b(?:REGION|LOCATION_SHORT|LOC\.? SHORT)[:\s\-\[]+(?P<code>\d{2})\b", text_clean, re.I)
-    if m and m.group("code") in region_map:
-        region_code = m.group("code")
-        loc_short = region_map[region_code]
-    else:
-        top = " \n".join(lines[:10])
-        m2 = re.search(r"\[(?P<code>\d{2})\]", top)
-        if m2 and m2.group("code") in region_map:
-            region_code = m2.group("code")
-            loc_short = region_map[region_code]
+    # MICROFILM_NAME from folder
+    mf_name = microfilm_name
+    if microfilm_from_folder:
+        # take top folder name from drive_rel_path if available
+        parts = drive_rel_path.split("/")
+        if len(parts) > 1:
+            mf_name = parts[0].strip() or microfilm_name
+
+    # Basic comments
+    comments = f"avg_conf={conf:.1f}; path={drive_rel_path}"
 
     row = Row(
-        FILE_NAME=Path(path).name,
+        FILE_NAME=local_path.name,
         COUNTRY=country,
         STATE=state,
         LOCATION=location,
-        LOCATION_SHORT=loc_short,
+        LOCATION_SHORT=location_short,
         REGION_CODE=region_code,
-        RECORDED_DATE=date,
+        RECORDED_DATE=recorded_date,
         LATITUDE=lat,
         LONGITUDE=lon,
-        SCALE=scale,
         IMAGES="1",
-        COMMENTS=f"avg_conf={conf:.1f}"
+        SCALE=scale,
+        MICROFILM_NAME=mf_name,
+        COMMENTS=comments,
     )
+
+    # Human-in-the-loop review if interactive
+    if interactive:
+        needs_any_review = any([
+            country_flag, state_flag, location_flag,
+            region_flag, loc_short_flag,
+            (recorded_date == ""), (scale == "")
+        ])
+
+        print("\n" + "="*72)
+        print(f"IMAGE: {drive_rel_path}")
+        print(f"LOCAL: {local_path}")
+        print("-"*72)
+
+        if needs_any_review:
+            print("Some fields need review. Quick edit mode:\n")
+        else:
+            print("Fields look good. You can still edit if you want:\n")
+
+        # Prompt core fields (flags drive attention)
+        row.COUNTRY = prompt_field("COUNTRY", row.COUNTRY, country_flag, allow_hint="NOAA allow-list")
+        row.STATE = prompt_field("STATE", row.STATE, state_flag, allow_hint="NOAA allow-list")
+        row.LOCATION = prompt_field("LOCATION", row.LOCATION, location_flag, allow_hint="NOAA allow-list")
+        row.RECORDED_DATE = prompt_field("RECORDED_DATE (YYYY/MM/DD)", row.RECORDED_DATE, row.RECORDED_DATE == "")
+        row.SCALE = prompt_field("SCALE (1:NN)", row.SCALE, row.SCALE == "")
+        row.REGION_CODE = prompt_field("REGION_CODE (NCEI 2-digit)", row.REGION_CODE, region_flag, allow_hint="must exist in NOAA regions")
+        row.LOCATION_SHORT = prompt_field("LOCATION_SHORT (IOC station code)", row.LOCATION_SHORT, loc_short_flag, allow_hint="from IOC list.php")
+        row.LATITUDE = prompt_field("LATITUDE (decimal)", row.LATITUDE, row.LATITUDE == "", allow_hint="geocode")
+        row.LONGITUDE = prompt_field("LONGITUDE (decimal)", row.LONGITUDE, row.LONGITUDE == "", allow_hint="geocode")
+        row.MICROFILM_NAME = prompt_field("MICROFILM_NAME", row.MICROFILM_NAME, row.MICROFILM_NAME == "")
+        row.IMAGES = prompt_field("IMAGES", row.IMAGES, row.IMAGES == "")
+        row.COMMENTS = prompt_field("COMMENTS", row.COMMENTS, False)
+
+        if not prompt_yes_no("Save this row to Excel?", default_yes=True):
+            raise RuntimeError("User skipped row in review mode.")
+
     return row
 
-# ---------------------------
-# Excel helpers
-# ---------------------------
-
-def gather_images(root: str) -> List[str]:
-    exts = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp"}
-    paths: List[str] = []
-    for p in sorted(Path(root).rglob("*")):
-        if p.suffix.lower() in exts:
-            paths.append(str(p))
-    return paths
-
-
-def ensure_excel(path: str) -> None:
-    p = Path(path)
-    if not p.exists():
-        df = pd.DataFrame(columns=DEFAULT_COLUMNS)
-        df.to_excel(path, index=False)
-
-
-def append_rows_to_excel(path: str, rows: List[Row]) -> None:
-    ensure_excel(path)
-    existing = pd.read_excel(path)
-    for col in DEFAULT_COLUMNS:
-        if col not in existing.columns:
-            existing[col] = ""
-    new_df = pd.DataFrame([asdict(r) for r in rows], columns=DEFAULT_COLUMNS)
-    out = pd.concat([existing, new_df], ignore_index=True)
-    out.to_excel(path, index=False)
 
 # ---------------------------
-# CLI
+# Main
 # ---------------------------
-
-def main():
-    ap = argparse.ArgumentParser(description="OCR marigram images and write Excel rows.")
-    ap.add_argument("--images", required=True, help="Folder containing marigram images (tif/png/jpg)")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Google Drive HITL OCR marigram images -> Excel")
+    ap.add_argument("--folder-ids", nargs="+", required=True, help="One or more Google Drive folder IDs")
     ap.add_argument("--out-xlsx", required=True, help="Output Excel path (.xlsx)")
-    ap.add_argument("--region-map", default=None, help="CSV with IOC region codes (id,description). If omitted, uses strict list in script.")
-    ap.add_argument("--country-list", default=None, help="TXT with known countries (one per line)")
-    ap.add_argument("--state-list", default=None, help="TXT with known states/regions (one per line)")
-    ap.add_argument("--location-list", default=None, help="TXT with known locations (one per line)")
-    ap.add_argument("--save-ocr", default=None, help="Optional folder to save OCR text and binarized image")
+    ap.add_argument("--cache-dir", default="./_drive_cache", help="Local cache directory for downloaded images")
+    ap.add_argument("--save-ocr", default=None, help="Optional folder to save OCR text + best-preprocessed image")
+    ap.add_argument("--resume", action="store_true", help="Resume using progress log (skip already processed files)")
+    ap.add_argument("--log-path", default="./_progress/processed.jsonl", help="Progress log path (jsonl)")
+    ap.add_argument("--interactive", action="store_true", help="Enable human-in-the-loop review prompts")
+    ap.add_argument("--enable-geocode", action="store_true", help="Enable Nominatim geocoding for lat/lon (rate-limited)")
+    ap.add_argument("--microfilm-name", default="", help="Default MICROFILM_NAME (if not using --microfilm-name-from-folder)")
+    ap.add_argument("--microfilm-name-from-folder", action="store_true", help="Set MICROFILM_NAME from top-level Drive folder name")
     args = ap.parse_args()
 
-    region_map = read_region_map(args.region_map)
-    countries = read_list(args.country_list)
-    states = read_list(args.state_list)
-    locations = read_list(args.location_list)
+    out_xlsx = str(Path(args.out_xlsx))
+    cache_dir = Path(args.cache_dir)
     save_ocr_dir = Path(args.save_ocr) if args.save_ocr else None
+    log_path = Path(args.log_path)
 
-    geocode_fn = make_geocoder()
+    # Fetch official lists
+    print("Fetching NOAA allow-lists (countries/states/locations/regions)...")
+    countries, states, locations, regions_map = fetch_noaa_lists()
+    print(f"  countries={len(countries)}, states={len(states)}, locations={len(locations)}, regions={len(regions_map)}")
 
-    paths = gather_images(args.images)
-    if not paths:
-        print(f"No images found under: {args.images}")
+    print("Fetching IOC station list (LOCATION_SHORT codes)...")
+    ioc_index = fetch_ioc_station_index()
+    print(f"  IOC index entries={len(ioc_index)}")
+
+    geocode_fn = make_geocoder(args.enable_geocode)
+
+    svc = drive_service()
+
+    # Traverse drive folder(s)
+    print("Listing files in Drive folders...")
+    id_to_relpath = drive_get_path_map(svc, args.folder_ids)
+    image_items = [(fid, rel) for fid, rel in id_to_relpath.items() if is_image_name(rel)]
+    if not image_items:
+        print("No images found in provided Drive folders.")
         sys.exit(1)
 
-    rows: List[Row] = []
-    for i, path in enumerate(paths, 1):
+    print(f"Found {len(image_items)} image files.")
+
+    processed: Set[str] = set()
+    if args.resume:
+        processed = load_processed_ids(log_path)
+        print(f"Resume enabled. Already processed: {len(processed)}")
+
+    rows_to_write: List[Row] = []
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+
+    default_microfilm = args.microfilm_name.strip()
+    if not default_microfilm and not args.microfilm_name_from_folder:
+        default_microfilm = "UNKNOWN"
+
+    for i, (file_id, rel_path) in enumerate(image_items, 1):
+        if args.resume and file_id in processed:
+            skip_count += 1
+            continue
+
         try:
-            row = process_image(path, region_map, countries, states, locations, save_ocr_dir, geocode_fn)
-            rows.append(row)
-            print(f"[{i}/{len(paths)}] OK -> {Path(path).name}")
+            # Download (cached)
+            local_path = cache_dir / rel_path
+            if not local_path.exists():
+                print(f"[{i}/{len(image_items)}] Downloading: {rel_path}")
+                drive_download_file(svc, file_id, local_path)
+            else:
+                print(f"[{i}/{len(image_items)}] Cached: {rel_path}")
+
+            row = process_one_image(
+                local_path=local_path,
+                drive_rel_path=rel_path,
+                countries=countries,
+                states=states,
+                locations=locations,
+                regions_map=regions_map,
+                ioc_index=ioc_index,
+                geocode_fn=geocode_fn,
+                save_ocr_dir=save_ocr_dir,
+                microfilm_name=default_microfilm,
+                microfilm_from_folder=args.microfilm_name_from_folder,
+                interactive=args.interactive,
+            )
+            rows_to_write.append(row)
+            ok_count += 1
+
+            append_log(log_path, {"file_id": file_id, "rel_path": rel_path, "status": "ok"})
+            print(f"  -> OK: {local_path.name}")
+
+            # Write in small batches so you don’t lose work
+            if len(rows_to_write) >= 25:
+                append_rows_to_excel(out_xlsx, rows_to_write)
+                rows_to_write = []
+                print("  -> wrote batch to Excel")
+
         except Exception as e:
-            print(f"[{i}/{len(paths)}] ERROR -> {Path(path).name}: {e}")
+            err_count += 1
+            append_log(log_path, {"file_id": file_id, "rel_path": rel_path, "status": "error", "error": str(e)})
+            print(f"  -> ERROR: {rel_path} :: {e}")
 
-    append_rows_to_excel(args.out_xlsx, rows)
-    print(f"\nWrote {len(rows)} rows to {args.out_xlsx}")
+    # Final flush
+    if rows_to_write:
+        append_rows_to_excel(out_xlsx, rows_to_write)
 
+    print("\nDone.")
+    print(f"  OK:   {ok_count}")
+    print(f"  SKIP: {skip_count}")
+    print(f"  ERR:  {err_count}")
+    print(f"Output: {out_xlsx}")
+    print(f"Log:    {log_path}")
 
 if __name__ == "__main__":
     main()
