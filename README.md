@@ -97,86 +97,109 @@ pip install opencv-python pillow pytesseract pandas openpyxl numpy \
             google-auth-httplib2 google-auth-oauthlib geopy
 ```
 
-## System Dependencies
+System Dependencies
+-------------------
 
 ### Tesseract OCR
 
-- **Ubuntu**
-  ```bash
-  sudo apt-get install tesseract-ocr
-  ```
-- **macOS**
-   ```bash
-  brew install tesseract
-  ```
-- **Windows**
-  Install Tesseract and add it to your system PATH
-  
-## Google Drive Access
+-   **Ubuntu**
+
+    `sudo apt-get install tesseract-ocr`
+
+-   **macOS**
+
+    `brew install tesseract`
+
+-   **Windows**\
+    Install Tesseract and add it to your system `PATH`
+
+* * * * *
+
+Google Drive Access
+-------------------
 
 The pipeline reads images directly from **Google Drive**.
 
 ### Setup
 
-1. Create a Google Cloud project  
-2. Enable the **Google Drive API**  
-3. Create OAuth credentials (**Desktop application**)  
-4. Download the credentials file as `credentials.json`  
-5. Place `credentials.json` in the same directory as the script  
+1.  Create a Google Cloud project
+
+2.  Enable the **Google Drive API**
+
+3.  Create OAuth credentials (**Desktop application**)
+
+4.  Download the credentials file as `credentials.json`
+
+5.  Place `credentials.json` in the same directory as the script
 
 On first run, a browser window opens to authorize access and creates a local `token.json`.
 
-## Running the Pipeline
+* * * * *
 
-```bash
-python drive_marigram_hitl_to_excel.py \
-  --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> ... \
-  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
-  --cache-dir ./_drive_cache \
-  --save-ocr ./_ocr_audit \
-  --resume \
-  --interactive \
-  --microfilm-name-from-folder
-```
-## Key Flags
+Running the Pipeline
+--------------------
 
-- `--interactive`  
-  Enables human-in-the-loop review prompts
+`python drive_marigram_hitl_to_excel.py\
+  --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> ...\
+  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
+  --cache-dir ./_drive_cache\
+  --save-ocr ./_ocr_audit\
+  --resume\
+  --interactive\
+  --microfilm-name-from-folder`
 
-- `--resume`  
-  Skips already processed files using a progress log
+* * * * *
 
-- `--enable-geocode`  
-  Enables latitude/longitude geocoding (rate-limited)
+Key Flags
+---------
 
-- `--microfilm-name-from-folder`  
-  Sets `MICROFILM_NAME` from the top-level Drive folder name
+-   `--interactive`\
+    Enables human-in-the-loop review prompts
 
-## Outputs
+-   `--resume`\
+    Skips already processed files using a progress log
 
-- Excel workbook containing structured marigram metadata
-- Optional OCR audit artifacts:
-  - Raw OCR text files
-  - Best preprocessed image per marigram
-- Progress log (`.jsonl`) for resumable processing
+-   `--enable-geocode`\
+    Enables latitude/longitude geocoding (rate-limited)
 
----
+-   `--microfilm-name-from-folder`\
+    Sets `MICROFILM_NAME` from the top-level Drive folder name
 
-## Notes & Limitations
+* * * * *
 
-- OCR quality varies depending on scan clarity and handwriting
-- Geocoding relies on external services and may be rate-limited
-- Some historical headers require manual interpretation
-- The pipeline intentionally avoids heuristic guessing to preserve archival integrity
+Outputs
+-------
 
----
+-   Excel workbook containing structured marigram metadata
 
-## License
+-   Optional OCR audit artifacts:
 
-This project is intended for research, archival processing, and educational use.  
+    -   Raw OCR text files
+
+    -   Best preprocessed image per marigram
+
+-   Progress log (`.jsonl`) for resumable processing
+
+* * * * *
+
+Notes & Limitations
+-------------------
+
+-   OCR quality varies depending on scan clarity and handwriting
+
+-   Geocoding relies on external services and may be rate-limited
+
+-   Some historical headers require manual interpretation
+
+-   The pipeline intentionally avoids heuristic guessing to preserve archival integrity
+
+* * * * *
+
+License
+-------
+
+This project is intended for research, archival processing, and educational use.\
 Please review NOAA and IOC data usage guidelines before redistributing derived datasets.
-
----
 
 ## Acknowledgements
 
