@@ -1,76 +1,187 @@
-# WaveSource: Tsunami-Marigram-Metadata-Extraction
+# WaveSource: Tsunami Marigram Metadata Extraction
 
-This is a Python-based tool designed to automatically extract, parse, and structure metadata from historical tsunami marigram records. These marigrams are often stored as TIFF images and contain critical tide gauge information such as latitude, longitude, event date, and comments. This project aims to make these records more discoverable, structured, and ready for further scientific analysis.
+WaveSource is a Python-based pipeline designed to **automatically extract, validate, and structure metadata from historical tsunami marigram (tide gauge) images**. These marigrams are typically stored as high-resolution TIFF scans and contain critical information such as station location, event date, scale, and region identifiers that are not machine-readable by default.
+
+The project combines **OCR, rule-based parsing, official metadata allow-lists, and a human-in-the-loop review step** to convert unstructured archival images into a structured Excel dataset suitable for scientific analysis and archival integration.
+
+---
 
 ## Project Background
-NOAA’s National Centers for Environmental Information (NCEI) maintains one of the largest archives of historical tsunami marigram (tide gauge) records. These records span from the mid-1800s to the late 20th century, capturing worldwide tsunami events across thousands of coastal stations.  
 
-Most marigrams exist as high-resolution TIFF scans from microfilm rolls, digitized under NOAA’s Climate Data Modernization Program (CDMP). However, these scans often lack structured metadata, making it difficult for researchers to search, analyze, and integrate them into modern databases.  
+NOAA’s National Centers for Environmental Information (NCEI) maintains one of the world’s largest archives of tsunami marigram records. Most of these records were digitized from microfilm under the Climate Data Modernization Program (CDMP) and are stored as scanned TIFF images.
 
-This project was created to **bridge that gap** by:
-- Running OCR to extract text from the marigram images.
-- Parsing geographic and temporal metadata into standardized formats.
-- Organizing the results into a structured CSV/Excel dataset.
-- Enabling researchers to query, validate, and extend the historical tsunami record.
+While a collection-level inventory exists (folders, scan counts, date ranges), **item-level metadata lives inside the images themselves** as printed or handwritten headers. Extracting this metadata manually is time-consuming and error-prone.
 
+WaveSource was built to bridge this gap by automating most of the metadata extraction process while preserving accuracy through controlled validation and manual review where needed.
 
-## Features
--  Extracts text from marigram TIFF images using OCR (Tesseract).
--  Cleans, normalizes, and parses metadata into structured formats.
--  Handles multiple latitude/longitude formats (decimal, signed, DMS).
--  Detects and standardizes event dates from handwritten or printed marigrams.
--  Outputs metadata into CSV/Excel for downstream research.
--  Includes regex-based parsing patterns for robust extraction.
--  Designed for extensibility to accommodate additional metadata fields.
+---
 
-## How It Works
-1. Input raw TIFF marigram scans.
-2. Run OCR (Tesseract) to extract text from images.
-3. Apply regex-based patterns to detect latitude, longitude, event dates, and comments.
-4. Normalize values into consistent formats (decimal degrees, ISO 8601 dates).
-5. Save results into a structured dataset (CSV/Excel).
+## What the Pipeline Does
 
-## Installation
+1. Reads marigram image files stored in Google Drive folders  
+2. Runs OCR (Tesseract) with multiple preprocessing strategies to maximize text quality  
+3. Parses key metadata fields using regex and layout heuristics  
+4. Validates extracted values against **official NOAA descriptor lists**  
+5. Resolves station codes using the **IOC Sea Level Monitoring Facility station list**  
+6. Optionally geocodes latitude/longitude from validated place names  
+7. Writes structured, standardized rows into an Excel workbook  
+8. Supports a **human-in-the-loop review** step for ambiguous or missing fields  
+
+---
+
+## Output Schema
+
+Each processed marigram produces a single row with the following fields:
+
+| Column Name | Description |
+|------------|-------------|
+| FILE_NAME | Image file name |
+| COUNTRY | NCEI country name |
+| STATE | NCEI state name |
+| LOCATION | NCEI location name |
+| LOCATION_SHORT | IOC Sea Level Monitoring station code |
+| REGION_CODE | NCEI tsunami region code |
+| START_RECORD | Start date of record (if present) |
+| END_RECORD | End date of record (if present) |
+| TSEVENT_ID | NCEI Tsunami Event ID |
+| TSRUNUP_ID | NCEI Tsunami Runup ID |
+| RECORDED_DATE | Date of tsunami event (YYYY/MM/DD) |
+| LATITUDE | Decimal latitude |
+| LONGITUDE | Decimal longitude |
+| IMAGES | Number of images in the marigram sequence |
+| SCALE | Scale factor (normalized to `1:NN`) |
+| MICROFILM_NAME | Microfilm identifier (manually set) |
+| COMMENTS | OCR confidence, anomalies, or notes |
+
+---
+
+## Authoritative Metadata Sources
+
+WaveSource strictly relies on **official reference lists** and never invents metadata values.
+
+### NOAA NCEI Descriptor APIs
+- Countries  
+  https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/countries
+- States / Regions  
+  https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/states
+- Locations (paginated)  
+  https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/locations
+- Tsunami Region Codes  
+  https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/regions
+
+### IOC Sea Level Monitoring Facility
+- Station codes (LOCATION_SHORT)  
+  https://www.ioc-sealevelmonitoring.org/list.php
+
+---
+
+## Automation vs Manual Review
+
+WaveSource is designed as a **human-in-the-loop system**:
+
+- If a value **matches an official allow-list**, it is accepted automatically  
+- If a value **does not match**, the OCR result is preserved and flagged  
+- Region codes and IOC station codes are only populated if they are **explicitly present and valid**  
+- Ambiguous or missing fields are reviewed and corrected manually  
+
+This approach ensures high accuracy while dramatically reducing manual data entry time.
+
+---
+
+## Requirements
+
+### Python Dependencies
 ```bash
-git clone https://github.com/<your-username>/Tsunami-Marigram-Metadata-Extractor.git
-cd Tsunami-Marigram-Metadata-Extractor
-pip install -r requirements.txt
-
-# Usage
-python extract_metadata.py --input ./data/marigrams/ --output ./output/metadata.csv
+pip install opencv-python pillow pytesseract pandas openpyxl numpy \
+            requests beautifulsoup4 google-api-python-client \
+            google-auth-httplib2 google-auth-oauthlib geopy
 ```
 
-## Output Columns
+## System Dependencies
+
+### Tesseract OCR
+
+- **Ubuntu**
+  ```bash
+  sudo apt-get install tesseract-ocr
+  ```
+- **macOS**
+   ```bash
+  brew install tesseract
+  ```
+- **Windows**
+  Install Tesseract and add it to your system  ```bash
+  PATH
+  ```
+## Google Drive Access
+
+The pipeline reads images directly from **Google Drive**.
+
+### Setup
+
+1. Create a Google Cloud project  
+2. Enable the **Google Drive API**  
+3. Create OAuth credentials (**Desktop application**)  
+4. Download the credentials file as `credentials.json`  
+5. Place `credentials.json` in the same directory as the script  
+
+On first run, a browser window opens to authorize access and creates a local `token.json`.
+
+## Running the Pipeline
 
 ```bash
-FILE_NAME, COUNTRY, STATE, LOCATION, LOCATION_SHORT, REGION_CODE,
-START_RECORD, END_RECORD, TSEVENT_ID, TSRUNUP_ID, RECORDED_DATE,
-LATITUDE, LONGITUDE, IMAGES, SCALE, MICROFILM_NAME, COMMENTS
+python drive_marigram_hitl_to_excel.py \
+  --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> ... \
+  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
+  --cache-dir ./_drive_cache \
+  --save-ocr ./_ocr_audit \
+  --resume \
+  --interactive \
+  --microfilm-name-from-folder
 ```
+## Key Flags
 
-## Regex Patterns
-The extractor uses multiple regex strategies to capture different latitude/longitude formats:
+- `--interactive`  
+  Enables human-in-the-loop review prompts
 
-- Decimal with N/S/E/W → 19.73 N 155.08 W
+- `--resume`  
+  Skips already processed files using a progress log
 
-- Signed decimal only → 19.73, -155.08
+- `--enable-geocode`  
+  Enables latitude/longitude geocoding (rate-limited)
 
-- DMS format → 19°43'N 155°05'W
+- `--microfilm-name-from-folder`  
+  Sets `MICROFILM_NAME` from the top-level Drive folder name
 
-## Tips & Troubleshooting
+## Outputs
 
-- Tesseract not found: ensure it’s installed and on PATH (see installation notes).
+- Excel workbook containing structured marigram metadata
+- Optional OCR audit artifacts:
+  - Raw OCR text files
+  - Best preprocessed image per marigram
+- Progress log (`.jsonl`) for resumable processing
 
-- OCR misses/streaking: the script already tries several binarizations; you can add deskew or morphology in the preprocessing function if needed.
+---
 
-- Geocoding ambiguous: add the place to locations.txt, or specify more context in the image header (COUNTRY/STATE/LOCATION). Nominatim is rate-limited; this script uses ~1 req/sec.
+## Notes & Limitations
 
-- Region code empty: ensure a valid IOC code (e.g., [85]) is present in the header or provide an explicit CSV mapping.
+- OCR quality varies depending on scan clarity and handwriting
+- Geocoding relies on external services and may be rate-limited
+- Some historical headers require manual interpretation
+- The pipeline intentionally avoids heuristic guessing to preserve archival integrity
 
-## Contributing
+---
 
-Contributions are welcome! Please open an issue or submit a pull request to suggest improvements.
+## License
 
+This project is intended for research, archival processing, and educational use.  
+Please review NOAA and IOC data usage guidelines before redistributing derived datasets.
 
+---
 
+## Acknowledgements
+
+- NOAA National Centers for Environmental Information (NCEI)
+- IOC Sea Level Monitoring Facility
+- Climate Data Modernization Program (CDMP)
 
