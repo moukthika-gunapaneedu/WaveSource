@@ -1,4 +1,4 @@
-# Tsunami-Marigram-Metadata-Extraction
+# WaveSource: Tsunami-Marigram-Metadata-Extraction
 
 This is a Python-based tool designed to automatically extract, parse, and structure metadata from historical tsunami marigram records. These marigrams are often stored as TIFF images and contain critical tide gauge information such as latitude, longitude, event date, and comments. This project aims to make these records more discoverable, structured, and ready for further scientific analysis.
 
