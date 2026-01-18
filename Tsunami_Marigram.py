@@ -185,10 +185,18 @@ def append_rows_to_excel(path: str, rows: List[Row]) -> None:
 # ---------------------------
 # NOAA allow-lists + region map
 # ---------------------------
-def _fetch_json(url: str, timeout: int = 30) -> dict:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def _fetch_json(url: str, timeout: int = 30, retries: int = 3, backoff: float = 1.5) -> dict:
+    last_err: Optional[Exception] = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff ** i)
+    raise RuntimeError(f"Failed to fetch JSON after {retries} tries: {url} :: {last_err}")
+
 
 def fetch_noaa_lists() -> Tuple[Set[str], Set[str], Set[str], Dict[str, str]]:
     """
@@ -312,18 +320,14 @@ def fetch_ioc_station_index(timeout: int = 30) -> Dict[Tuple[str, str], str]:
     return index
 
 def resolve_location_short_strict(country: str, location: str, ioc_index: Dict[Tuple[str, str], str]) -> Tuple[str, bool]:
-    """
-    Strict resolver:
-      exact (COUNTRY, LOCATION) match -> IOC code
-    else blank for human review.
-    """
+    if not ioc_index:
+        return "", True
     if not country or not location:
         return "", True
     code = ioc_index.get((_upper(country), _upper(location)), "")
     if code and IOC_CODE_RE.match(code):
         return code, False
     return "", True
-
 
 # ---------------------------
 # OCR pipeline
@@ -718,8 +722,13 @@ def main() -> None:
     print(f"  countries={len(countries)}, states={len(states)}, locations={len(locations)}, regions={len(regions_map)}")
 
     print("Fetching IOC station list (LOCATION_SHORT codes)...")
-    ioc_index = fetch_ioc_station_index()
-    print(f"  IOC index entries={len(ioc_index)}")
+    try:
+        ioc_index = fetch_ioc_station_index()
+        print(f"  IOC index entries={len(ioc_index)}")
+    except Exception as e:
+        print(f"  IOC fetch failed, continuing without IOC codes: {e}")
+        ioc_index = {}
+
 
     geocode_fn = make_geocoder(args.enable_geocode)
 
