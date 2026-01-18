@@ -110,9 +110,8 @@ pip install opencv-python pillow pytesseract pandas openpyxl numpy \
   brew install tesseract
   ```
 - **Windows**
-  Install Tesseract and add it to your system  ```bash
-  PATH
-  ```
+  Install Tesseract and add it to your system PATH
+  
 ## Google Drive Access
 
 The pipeline reads images directly from **Google Drive**.
