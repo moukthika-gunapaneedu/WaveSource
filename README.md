@@ -18,14 +18,14 @@ WaveSource was built to bridge this gap by automating most of the metadata extra
 
 ## What the Pipeline Does
 
-1. Reads marigram image files stored in Google Drive folders  
-2. Runs OCR (Tesseract) with multiple preprocessing strategies to maximize text quality  
-3. Parses key metadata fields using regex and layout heuristics  
-4. Validates extracted values against **official NOAA descriptor lists**  
-5. Resolves station codes using the **IOC Sea Level Monitoring Facility station list**  
-6. Optionally geocodes latitude/longitude from validated place names  
-7. Writes structured, standardized rows into an Excel workbook  
-8. Supports a **human-in-the-loop review** step for ambiguous or missing fields  
+1. Reads marigram image files stored in Google Drive folders (recursively)
+2. Runs OCR (Tesseract) with multiple preprocessing strategies to maximize text quality
+3. Parses key metadata fields using regex-based and lightweight structural heuristics
+4. Validates extracted values against **official NOAA descriptor allow-lists**
+5. Resolves station codes using the **IOC Sea Level Monitoring Facility station list**
+6. Optionally geocodes latitude and longitude from validated place names
+7. Writes structured, standardized rows into an Excel workbook
+8. Supports a **human-in-the-loop review** step for ambiguous or missing fields
 
 ---
 
@@ -35,23 +35,25 @@ Each processed marigram produces a single row with the following fields:
 
 | Column Name | Description |
 |------------|-------------|
-| FILE_NAME | Image file name |
+| FILE_NAME | Drive-relative image path (including folder structure) |
 | COUNTRY | NCEI country name |
-| STATE | NCEI state name |
+| STATE | NCEI state or prefecture name |
 | LOCATION | NCEI location name |
-| LOCATION_SHORT | IOC Sea Level Monitoring station code |
-| REGION_CODE | NCEI tsunami region code |
-| START_RECORD | Start date of record (if present) |
-| END_RECORD | End date of record (if present) |
-| TSEVENT_ID | NCEI Tsunami Event ID |
-| TSRUNUP_ID | NCEI Tsunami Runup ID |
-| RECORDED_DATE | Date of tsunami event (YYYY/MM/DD) |
-| LATITUDE | Decimal latitude |
-| LONGITUDE | Decimal longitude |
-| IMAGES | Number of images in the marigram sequence |
-| SCALE | Scale factor (normalized to `1:NN`) |
-| MICROFILM_NAME | Microfilm identifier (manually set) |
-| COMMENTS | OCR confidence, anomalies, or notes |
+| LOCATION_SHORT | IOC Sea Level Monitoring station code (strict match only) |
+| REGION_CODE | NCEI tsunami region code (2-digit, explicit only) |
+| START_RECORD | Reserved column (not currently parsed) |
+| END_RECORD | Reserved column (not currently parsed) |
+| TSEVENT_ID | Reserved column (not currently parsed) |
+| TSRUNUP_ID | Reserved column (not currently parsed) |
+| RECORDED_DATE | Date of tsunami event (`YYYY/MM/DD`) |
+| LATITUDE | Decimal latitude (optional geocoding) |
+| LONGITUDE | Decimal longitude (optional geocoding) |
+| IMAGES | Number of images per record (currently set to `1` per file) |
+| SCALE | Scale factor normalized to `1:NN` |
+| MICROFILM_NAME | Microfilm identifier (set manually or from folder name) |
+| COMMENTS | OCR confidence, processing notes, or anomalies |
+
+> Columns marked as *reserved* are included for schema completeness and future extension.
 
 ---
 
@@ -62,7 +64,7 @@ WaveSource strictly relies on **official reference lists** and never invents met
 ### NOAA NCEI Descriptor APIs
 - Countries  
   https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/countries
-- States / Regions  
+- States  
   https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/states
 - Locations (paginated)  
   https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/locations
@@ -70,7 +72,7 @@ WaveSource strictly relies on **official reference lists** and never invents met
   https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/regions
 
 ### IOC Sea Level Monitoring Facility
-- Station codes (LOCATION_SHORT)  
+- Station codes (`LOCATION_SHORT`)  
   https://www.ioc-sealevelmonitoring.org/list.php
 
 ---
@@ -79,12 +81,12 @@ WaveSource strictly relies on **official reference lists** and never invents met
 
 WaveSource is designed as a **human-in-the-loop system**:
 
-- If a value **matches an official allow-list**, it is accepted automatically  
-- If a value **does not match**, the OCR result is preserved and flagged  
-- Region codes and IOC station codes are only populated if they are **explicitly present and valid**  
-- Ambiguous or missing fields are reviewed and corrected manually  
+- If a value **matches an official allow-list**, it is accepted automatically
+- If a value **does not match**, the OCR result is preserved and flagged
+- Region codes and IOC station codes are populated **only if explicitly present and valid**
+- Ambiguous or missing fields are reviewed and corrected manually
 
-This approach ensures high accuracy while dramatically reducing manual data entry time.
+This approach ensures high accuracy while dramatically reducing manual data entry time without introducing speculative metadata.
 
 ---
 
