@@ -151,20 +151,20 @@ python Tsunami_Marigram.py \
 
 ### Interactive review mode (for cleanup passes)
 ```bash
-python Tsunami_Marigram.py\
-  --folder-ids <FOLDER_ID_1>\
-  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
-  --interactive\
+python Tsunami_Marigram.py \
+  --folder-ids <FOLDER_ID_1> \
+  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
+  --interactive \
   --resume
 ```
 
 ### Optional: enable geocoding (rate-limited)
 
 ```bash
-python Tsunami_Marigram.py\
-  --folder-ids <FOLDER_ID_1>\
-  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
-  --enable-geocode\
+python Tsunami_Marigram.py \
+  --folder-ids <FOLDER_ID_1> \
+  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
+  --enable-geocode \
   --resume
 ```
 
