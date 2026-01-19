@@ -40,47 +40,27 @@ WaveSource was built to bridge this gap by automating most of the metadata extra
 
 Each processed marigram produces a single row with the following fields:
 
-| Column Name | Description |
-
-|------------|-------------|
-
-| FILE_NAME | Drive-relative image path (including folder structure) |
-
-| COUNTRY | NCEI country name |
-
-| STATE | NCEI state or prefecture name |
-
-| LOCATION | NCEI location name |
-
-| LOCATION_SHORT | IOC Sea Level Monitoring station code (strict match only) |
-
-| REGION_CODE | NCEI tsunami region code (2-digit, explicit only) |
-
-| START_RECORD | Reserved column (not currently parsed) |
-
-| END_RECORD | Reserved column (not currently parsed) |
-
-| TSEVENT_ID | Reserved column (not currently parsed) |
-
-| TSRUNUP_ID | Reserved column (not currently parsed) |
-
-| RECORDED_DATE | Date of tsunami event (`YYYY/MM/DD`) |
-
-| LATITUDE | Decimal latitude (optional geocoding) |
-
-| LONGITUDE | Decimal longitude (optional geocoding) |
-
-| IMAGES | Number of images per record (currently set to `1` per file) |
-
-| SCALE | Scale factor normalized to `1:NN` |
-
-| MICROFILM_NAME | Microfilm identifier (set manually or from folder name) |
-
-| COMMENTS | OCR confidence, processing notes, or anomalies |
+| Column Name      | Description |
+|------------------|-------------|
+| FILE_NAME        | Drive-relative image path (including folder structure) |
+| COUNTRY          | NCEI country name |
+| STATE            | NCEI state or prefecture name |
+| LOCATION         | NCEI location name |
+| LOCATION_SHORT   | IOC Sea Level Monitoring station code (strict match only) |
+| REGION_CODE      | NCEI tsunami region code (2-digit, explicit only) |
+| START_RECORD     | Reserved column (not currently parsed) |
+| END_RECORD       | Reserved column (not currently parsed) |
+| TSEVENT_ID       | Reserved column (not currently parsed) |
+| TSRUNUP_ID       | Reserved column (not currently parsed) |
+| RECORDED_DATE    | Date of tsunami event (`YYYY/MM/DD`) |
+| LATITUDE         | Decimal latitude (optional geocoding) |
+| LONGITUDE        | Decimal longitude (optional geocoding) |
+| IMAGES           | Number of images per record (currently set to `1` per file) |
+| SCALE            | Scale factor normalized to `1:NN` |
+| MICROFILM_NAME   | Microfilm identifier (set manually or from folder name) |
+| COMMENTS         | OCR confidence, processing notes, or anomalies |
 
 > Columns marked as *reserved* are included for schema completeness and future extension.
-
----
 
 ## Authoritative Metadata Sources
 
