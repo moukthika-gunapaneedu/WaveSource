@@ -24,7 +24,7 @@ What this script does
 9) Append structured rows to Excel (.xlsx), and keep a progress log so it can be resumed
 
 Install (pip)
-  pip install opencv-python pillow pytesseract pandas openpyxl numpy requests beautifulsoup4 \
+  pip install opencv-python pillow pytesseract openpyxl numpy requests beautifulsoup4 \
               google-api-python-client google-auth-httplib2 google-auth-oauthlib geopy
 
 System deps
@@ -41,18 +41,16 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import os
 import random
 import re
 import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
-import pandas as pd  # type: ignore
 import pytesseract  # type: ignore
 import requests  # type: ignore
 from PIL import Image  # type: ignore
@@ -186,7 +184,7 @@ def ensure_excel(path: str) -> None:
 
 def append_rows_to_excel(path: str, rows: List[Row]) -> None:
     """
-    Appends rows without loading the entire sheet into pandas each time.
+    Appends rows without loading the entire sheet into memory each time.
     This stays fast even when you’re writing thousands of images.
     """
     ensure_excel(path)
@@ -288,7 +286,9 @@ def fetch_ioc_station_index(timeout: int = 30, cache_path: Optional[Path] = None
     if cache_path and cache_path.exists():
         html = cache_path.read_text(encoding="utf-8", errors="ignore")
     else:
-        html = requests.get(IOC_LIST_URL, timeout=timeout).text
+        r = requests.get(IOC_LIST_URL, timeout=timeout)
+        r.raise_for_status()
+        html = r.text
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(html, encoding="utf-8")
@@ -389,57 +389,72 @@ def preprocess_variants(img: np.ndarray) -> List[np.ndarray]:
 
     return out
 
-def _ocr_to_data(pil_img: Image.Image, config: str) -> Tuple[List[str], List[float]]:
+def _ocr_avg_conf(pil_img: Image.Image, config: str) -> float:
     """
-    Pull token text + confidence. Prefer DATAFRAME, but fall back if it’s flaky in the environment.
+    Compute an average confidence score from Tesseract's image_to_data output.
+    Returns 0.0 if confidence is unavailable.
     """
-    tokens: List[str] = []
     confs: List[float] = []
 
+    # Try DATAFRAME first
     try:
-        df = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DATAFRAME)
-        # df["text"] can contain NaN; conf can be int/float/str
-        for t in df["text"].fillna("").tolist():
-            ts = str(t).strip()
-            if ts:
-                tokens.append(ts)
+        df = pytesseract.image_to_data(
+            pil_img,
+            config=config,
+            output_type=pytesseract.Output.DATAFRAME
+        )
         if "conf" in df.columns:
             for c in df["conf"].tolist():
                 try:
                     cf = float(c)
+                    # Tesseract uses -1 for "not a word"
                     if cf >= 0:
                         confs.append(cf)
                 except Exception:
-                    pass
-        return tokens, confs
+                    continue
+        return float(np.mean(confs)) if confs else 0.0
     except Exception:
         pass
 
+    # Fall back to DICT
     try:
-        d = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DICT)
-        for t in d.get("text", []):
-            ts = str(t).strip()
-            if ts:
-                tokens.append(ts)
+        d = pytesseract.image_to_data(
+            pil_img,
+            config=config,
+            output_type=pytesseract.Output.DICT
+        )
         for c in d.get("conf", []):
             try:
                 cf = float(c)
                 if cf >= 0:
                     confs.append(cf)
             except Exception:
-                pass
-        return tokens, confs
+                continue
+        return float(np.mean(confs)) if confs else 0.0
     except Exception:
-        return [], []
+        return 0.0
+
 
 def ocr_image(img: np.ndarray, psm: int = 6, oem: int = 3) -> Tuple[str, float]:
+    """
+    OCR with:
+      - full text from image_to_string (better for your regex parsing)
+      - avg confidence from image_to_data
+    """
     config = f"--psm {psm} --oem {oem}"
     pil_img = Image.fromarray(img)
 
-    tokens, confs = _ocr_to_data(pil_img, config=config)
-    text = "\n".join(tokens)
-    avg_conf = float(np.mean(confs)) if confs else 0.0
-    return text, avg_conf
+    # Full OCR text
+    try:
+        text_full = pytesseract.image_to_string(pil_img, config=config)
+    except Exception:
+        text_full = ""
+
+    # Average confidence
+    avg_conf = _ocr_avg_conf(pil_img, config=config)
+
+    return text_full, avg_conf
+
 
 def _anchor_score(text: str) -> int:
     if not text:
@@ -495,7 +510,7 @@ def parse_country_state_location(lines: List[str]) -> Tuple[str, str, str]:
         if m:
             return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
 
-    # B) Semicolon/comma triplets, but only if all 3 pieces look like real text
+    # B) Semicolon/comma triplets
     for line in lines[:30]:
         parts = re.split(r"\s*[;,\t]\s*", line.strip())
         if len(parts) >= 3:
@@ -766,7 +781,7 @@ def process_one_image(
             mf_name = parts[0].strip() or microfilm_name
 
     # Comments: keep it simple and actually useful for auditing
-    comments = f"avg_conf={conf:.1f}; anchors={anchor_score}; psm={psm}; path={drive_rel_path}"
+    comments = f"avg_conf={conf:.1f}; anchors={anchor_score}; psm={psm}; oem={oem}; path={drive_rel_path}"
 
     row = Row(
         FILE_NAME=drive_rel_path,
