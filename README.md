@@ -168,6 +168,10 @@ python Tsunami_Marigram.py\
   --resume
 ```
 
+> **Note (Windows PowerShell):**  
+> PowerShell does not support line continuation with `\`.  
+> Run the command on a single line instead.
+
 Key Flags
 ---------
 
