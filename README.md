@@ -160,7 +160,6 @@ Verify installation:
 * * * * *
 
 Google Drive Access
--------------------
 
 The pipeline reads images directly from **Google Drive**.
 
@@ -181,7 +180,6 @@ On first run, a browser window opens to authorize access and creates a local `to
 * * * * *
 
 Running the Pipeline
---------------------
 
 By default, the pipeline runs in **non-interactive batch mode**.\
 The `--interactive` flag is intended for cleanup or validation passes only.
@@ -198,7 +196,6 @@ The `--interactive` flag is intended for cleanup or validation passes only.
 * * * * *
 
 Key Flags
----------
 
 -   `--interactive`\
     Enables human-in-the-loop review prompts
@@ -215,7 +212,6 @@ Key Flags
 * * * * *
 
 Outputs
--------
 
 -   Excel workbook containing structured marigram metadata
 
@@ -232,7 +228,6 @@ Outputs
 * * * * *
 
 Notes & Limitations
--------------------
 
 -   OCR quality varies depending on scan clarity and handwriting
 
@@ -245,7 +240,6 @@ Notes & Limitations
 * * * * *
 
 License
--------
 
 This project is intended for research, archival processing, and educational use.\
 Please review NOAA and IOC data usage guidelines before redistributing derived datasets.
@@ -253,7 +247,6 @@ Please review NOAA and IOC data usage guidelines before redistributing derived d
 * * * * *
 
 Acknowledgements
-----------------
 
 -   NOAA National Centers for Environmental Information (NCEI)
 
