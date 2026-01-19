@@ -4,8 +4,6 @@ WaveSource is a Python-based pipeline designed to **automatically extract, valid
 
 The project combines **OCR, rule-based parsing, official metadata allow-lists, and a human-in-the-loop review step** to convert unstructured archival images into a structured dataset suitable for scientific analysis and archival integration.
 
----
-
 ## Project Background
 
 NOAA's National Centers for Environmental Information (NCEI) maintains one of the world's largest archives of tsunami marigram records. Most of these records were digitized from microfilm under the Climate Data Modernization Program (CDMP) and are stored as scanned TIFF images.
@@ -13,8 +11,6 @@ NOAA's National Centers for Environmental Information (NCEI) maintains one of th
 While a collection-level inventory exists (folders, scan counts, date ranges), **item-level metadata lives inside the images themselves** as printed or handwritten headers. Extracting this metadata manually is time-consuming and error-prone.
 
 WaveSource was built to bridge this gap by automating most of the metadata extraction process while preserving accuracy through controlled validation and manual review where needed.
-
----
 
 ## What the Pipeline Does
 
@@ -33,8 +29,6 @@ WaveSource was built to bridge this gap by automating most of the metadata extra
 7\. Writes structured, standardized rows into an Excel workbook
 
 8\. Supports a **human-in-the-loop review** step for ambiguous or missing fields
-
----
 
 ## Output Schema
 
@@ -90,8 +84,6 @@ WaveSource strictly relies on **official reference lists** and never invents met
 
   https://www.ioc-sealevelmonitoring.org/list.php
 
----
-
 ## Automation vs Manual Review
 
 WaveSource is designed as a **human-in-the-loop system**:
@@ -105,8 +97,6 @@ WaveSource is designed as a **human-in-the-loop system**:
 - Ambiguous or missing fields are reviewed and corrected manually
 
 This approach ensures high accuracy while dramatically reducing manual data entry time without introducing speculative metadata.
-
----
 
 ## Requirements
 
@@ -137,8 +127,6 @@ Verify installation:
 
 `tesseract --version`
 
-* * * * *
-
 Google Drive Access
 -------------------
 
@@ -158,8 +146,6 @@ The pipeline reads images directly from **Google Drive**.
 
 On first run, a browser window opens to authorize access and creates a local `token.json`.
 
-* * * * *
-
 Running the Pipeline
 --------------------
 
@@ -174,8 +160,6 @@ The `--interactive` flag is intended for cleanup or validation passes only.
   --save-ocr ./_ocr_audit\
   --resume\
   --microfilm-name-from-folder`
-
-* * * * *
 
 Key Flags
 ---------
@@ -192,8 +176,6 @@ Key Flags
 -   `--microfilm-name-from-folder`\
     Sets `MICROFILM_NAME` from the top-level Drive folder name
 
-* * * * *
-
 Outputs
 -------
 
@@ -209,8 +191,6 @@ Outputs
 
 -   Progress log (`.jsonl`) for resumable processing
 
-* * * * *
-
 Notes & Limitations
 -------------------
 
@@ -222,15 +202,11 @@ Notes & Limitations
 
 -   The pipeline intentionally avoids heuristic guessing to preserve archival integrity
 
-* * * * *
-
 License
 -------
 
 This project is intended for research, archival processing, and educational use.\
 Please review NOAA and IOC data usage guidelines before redistributing derived datasets.
-
-* * * * *
 
 Acknowledgements
 ----------------
