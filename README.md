@@ -139,30 +139,34 @@ Running the Pipeline
 
 ### Non-interactive (recommended for batch runs)
 
-`python Tsunami_Marigram.py\
-  --folder-ids <FOLDER_ID_1> <FOLDER_ID_2>\
-  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
-  --cache-dir ./_drive_cache\
-  --save-ocr ./_ocr_audit\
-  --resume\
-  --microfilm-name-from-folder`
+```bash
+python Tsunami_Marigram.py \
+  --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> \
+  --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
+  --cache-dir ./_drive_cache \
+  --save-ocr ./_ocr_audit \
+  --resume \
+  --microfilm-name-from-folder
+```
 
 ### Interactive review mode (for cleanup passes)
-
-`python Tsunami_Marigram.py\
+```bash
+python Tsunami_Marigram.py\
   --folder-ids <FOLDER_ID_1>\
   --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
   --interactive\
-  --resume`
+  --resume
+```
 
 ### Optional: enable geocoding (rate-limited)
 
-`python Tsunami_Marigram.py\
+```bash
+python Tsunami_Marigram.py\
   --folder-ids <FOLDER_ID_1>\
   --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx\
   --enable-geocode\
-  --resume`
-
+  --resume
+```
 
 Key Flags
 ---------
