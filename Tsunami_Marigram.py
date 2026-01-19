@@ -5,7 +5,7 @@ WaveSource — Google Drive Marigram OCR -> Excel (Human-in-the-loop)
 
 What this script does
 1) Pull marigram images from Google Drive folders (recursively)
-2) OCR each image (Tesseract + OpenCV preprocessing variants)
+2) OCR each image (Tesseract + a few OpenCV preprocessing variants)
 3) Parse key fields (COUNTRY / STATE / LOCATION / RECORDED_DATE / SCALE)
 4) Validate (but DO NOT guess) against NOAA descriptor allow-lists:
    - COUNTRY: https://www.ngdc.noaa.gov/hazel/hazard-service/api/v1/descriptors/tsunamis/marigrams/countries
@@ -34,16 +34,6 @@ Google Drive Auth
   - Create OAuth Client credentials (Desktop) in Google Cloud Console
   - Save as ./credentials.json
   - First run creates ./token.json after browser auth
-
-Usage
-  python drive_marigram_hitl_to_excel.py \
-      --folder-ids <FOLDER_ID_1> <FOLDER_ID_2> \
-      --out-xlsx ./Tsunami_Microfilm_Inventory_Output.xlsx \
-      --microfilm-name-from-folder \
-      --save-ocr ./_ocr_audit \
-      --cache-dir ./_drive_cache \
-      --resume \
-      --enable-geocode
 """
 
 from __future__ import annotations
@@ -52,6 +42,7 @@ import argparse
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -67,8 +58,12 @@ import requests  # type: ignore
 from PIL import Image  # type: ignore
 from bs4 import BeautifulSoup  # type: ignore
 
+# Excel appending without re-reading the whole file each time
+from openpyxl import Workbook, load_workbook  # type: ignore
+
 # Google Drive API
 from googleapiclient.discovery import build  # type: ignore
+from googleapiclient.errors import HttpError  # type: ignore
 from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from google.oauth2.credentials import Credentials  # type: ignore
 from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
@@ -125,6 +120,15 @@ UPPER_TRIPLE_SPLIT = re.compile(
 # Strict IOC code appearance (4-5 usually, allow 3-6 to be safe)
 IOC_CODE_RE = re.compile(r"^[A-Za-z0-9]{3,6}$")
 
+# Quick “anchors” that are common on these sheets
+OCR_ANCHORS = [
+    r"\bCOUNTRY\b",
+    r"\bSTATE\b",
+    r"\bLOCATION\b",
+    r"\bSCALE\b",
+    r"\bREGION\b",
+]
+
 
 # ---------------------------
 # Data model
@@ -166,26 +170,45 @@ def safe_filename(name: str) -> str:
     name = re.sub(r"[^\w.\- ]+", "_", name)
     return name.strip() or "file"
 
+def is_image_name(name: str) -> bool:
+    ext = Path(name).suffix.lower()
+    return ext in {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp"}
+
 def ensure_excel(path: str) -> None:
     p = Path(path)
-    if not p.exists():
-        pd.DataFrame(columns=DEFAULT_COLUMNS).to_excel(path, index=False)
+    if p.exists():
+        return
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(DEFAULT_COLUMNS)
+    wb.save(path)
 
 def append_rows_to_excel(path: str, rows: List[Row]) -> None:
+    """
+    Appends rows without loading the entire sheet into pandas each time.
+    This stays fast even when you’re writing thousands of images.
+    """
     ensure_excel(path)
-    existing = pd.read_excel(path)
-    for col in DEFAULT_COLUMNS:
-        if col not in existing.columns:
-            existing[col] = ""
-    new_df = pd.DataFrame([asdict(r) for r in rows], columns=DEFAULT_COLUMNS)
-    out = pd.concat([existing, new_df], ignore_index=True)
-    out.to_excel(path, index=False)
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # If someone created a blank workbook manually, fix header.
+    if ws.max_row == 1 and all((ws.cell(1, i+1).value or "") == "" for i in range(len(DEFAULT_COLUMNS))):
+        ws.delete_rows(1, 1)
+        ws.append(DEFAULT_COLUMNS)
+
+    for r in rows:
+        d = asdict(r)
+        ws.append([d.get(col, "") for col in DEFAULT_COLUMNS])
+
+    wb.save(path)
 
 
 # ---------------------------
 # NOAA allow-lists + region map
 # ---------------------------
-def _fetch_json(url: str, timeout: int = 30, retries: int = 3, backoff: float = 1.5) -> dict:
+def _fetch_json(url: str, timeout: int = 30, retries: int = 4, backoff: float = 1.7) -> dict:
     last_err: Optional[Exception] = None
     for i in range(retries):
         try:
@@ -196,7 +219,6 @@ def _fetch_json(url: str, timeout: int = 30, retries: int = 3, backoff: float = 
             last_err = e
             time.sleep(backoff ** i)
     raise RuntimeError(f"Failed to fetch JSON after {retries} tries: {url} :: {last_err}")
-
 
 def fetch_noaa_lists() -> Tuple[Set[str], Set[str], Set[str], Dict[str, str]]:
     """
@@ -211,7 +233,7 @@ def fetch_noaa_lists() -> Tuple[Set[str], Set[str], Set[str], Dict[str, str]]:
     states    = {_upper(x["description"]) for x in states_j.get("items", [])}
     regions   = {str(x["id"]).strip(): str(x["description"]).strip() for x in regions_j.get("items", [])}
 
-    # Locations are paginated (397 -> 2 pages today, but do not assume)
+    # Locations are paginated; don’t assume how many pages.
     page1 = _fetch_json(NOAA_LOCATIONS_URL.format(page=1))
     total_pages = int(page1.get("totalPages", 1))
     locations: Set[str] = {_upper(x["description"]) for x in page1.get("items", [])}
@@ -224,7 +246,7 @@ def fetch_noaa_lists() -> Tuple[Set[str], Set[str], Set[str], Dict[str, str]]:
 def validate_against_allow_list(value: str, allow: Set[str]) -> Tuple[str, bool]:
     """
     Returns (kept_value, needs_review).
-    - If exact upper-case match exists in allow-list => returns normalized UPPER value, needs_review=False
+    - If exact upper-case match exists => returns normalized UPPER value, needs_review=False
     - Else keep OCR text as-is (no guessing), needs_review=True
     """
     if not value or not value.strip():
@@ -241,18 +263,11 @@ def parse_region_code_strict(ocr_text: str, regions_map: Dict[str, str]) -> Tupl
     if not ocr_text:
         return "", True
 
-    # [85]
     m = re.search(r"\[(\d{2})\]", ocr_text)
     if m and m.group(1) in regions_map:
         return m.group(1), False
 
-    # REGION: 85 / REGION 85
     m = re.search(r"\bREGION\b[^0-9]*(\d{2})\b", ocr_text, re.I)
-    if m and m.group(1) in regions_map:
-        return m.group(1), False
-
-    # LOCATION_SHORT: 85
-    m = re.search(r"\b(?:LOCATION_SHORT|LOC\.?\s*SHORT)\b[^0-9]*(\d{2})\b", ocr_text, re.I)
     if m and m.group(1) in regions_map:
         return m.group(1), False
 
@@ -262,13 +277,22 @@ def parse_region_code_strict(ocr_text: str, regions_map: Dict[str, str]) -> Tupl
 # ---------------------------
 # IOC station code index (LOCATION_SHORT)
 # ---------------------------
-def fetch_ioc_station_index(timeout: int = 30) -> Dict[Tuple[str, str], str]:
+def fetch_ioc_station_index(timeout: int = 30, cache_path: Optional[Path] = None) -> Dict[Tuple[str, str], str]:
     """
     Scrape IOC list.php to build:
       (COUNTRY_UPPER, LOCATION_UPPER) -> IOC_CODE
-    If IOC markup changes, you may need to adjust the table/header detection.
+
+    If cache_path is set, store/read IOC HTML so repeated runs are reproducible and faster.
     """
-    html = requests.get(IOC_LIST_URL, timeout=timeout).text
+    html: str
+    if cache_path and cache_path.exists():
+        html = cache_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        html = requests.get(IOC_LIST_URL, timeout=timeout).text
+        if cache_path:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(html, encoding="utf-8")
+
     soup = BeautifulSoup(html, "html.parser")
 
     tables = soup.find_all("table")
@@ -320,14 +344,13 @@ def fetch_ioc_station_index(timeout: int = 30) -> Dict[Tuple[str, str], str]:
     return index
 
 def resolve_location_short_strict(country: str, location: str, ioc_index: Dict[Tuple[str, str], str]) -> Tuple[str, bool]:
-    if not ioc_index:
-        return "", True
-    if not country or not location:
+    if not ioc_index or not country or not location:
         return "", True
     code = ioc_index.get((_upper(country), _upper(location)), "")
     if code and IOC_CODE_RE.match(code):
         return code, False
     return "", True
+
 
 # ---------------------------
 # OCR pipeline
@@ -341,62 +364,147 @@ def load_image_cv(path: str) -> np.ndarray:
 def preprocess_variants(img: np.ndarray) -> List[np.ndarray]:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     out: List[np.ndarray] = []
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(th)
-    _, th_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU); out.append(th_inv)
-    ad = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11); out.append(ad)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
-    _, th2 = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(th2)
-    blur = cv2.GaussianBlur(gray, (3,3), 0)
-    _, th3 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(th3)
+
+    # Otsu
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(th)
+
+    # Inverted Otsu (sometimes labels pop better)
+    _, th_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    out.append(th_inv)
+
+    # Adaptive threshold
+    ad = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    out.append(ad)
+
+    # CLAHE -> Otsu
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    _, th2 = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(th2)
+
+    # Light blur -> Otsu (helps with speckle)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, th3 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(th3)
+
     return out
 
-def ocr_image(img: np.ndarray) -> Tuple[str, float]:
-    config = "--psm 6 --oem 3"
-    pil_img = Image.fromarray(img)
-    data = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DATAFRAME)
-    text = "\n".join([str(t) for t in data["text"].fillna("") if str(t).strip()])
+def _ocr_to_data(pil_img: Image.Image, config: str) -> Tuple[List[str], List[float]]:
+    """
+    Pull token text + confidence. Prefer DATAFRAME, but fall back if it’s flaky in the environment.
+    """
+    tokens: List[str] = []
     confs: List[float] = []
-    for c in data.get("conf", []).tolist():
-        try:
-            cf = float(c)
-            if cf >= 0:
-                confs.append(cf)
-        except Exception:
-            continue
+
+    try:
+        df = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DATAFRAME)
+        # df["text"] can contain NaN; conf can be int/float/str
+        for t in df["text"].fillna("").tolist():
+            ts = str(t).strip()
+            if ts:
+                tokens.append(ts)
+        if "conf" in df.columns:
+            for c in df["conf"].tolist():
+                try:
+                    cf = float(c)
+                    if cf >= 0:
+                        confs.append(cf)
+                except Exception:
+                    pass
+        return tokens, confs
+    except Exception:
+        pass
+
+    try:
+        d = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DICT)
+        for t in d.get("text", []):
+            ts = str(t).strip()
+            if ts:
+                tokens.append(ts)
+        for c in d.get("conf", []):
+            try:
+                cf = float(c)
+                if cf >= 0:
+                    confs.append(cf)
+            except Exception:
+                pass
+        return tokens, confs
+    except Exception:
+        return [], []
+
+def ocr_image(img: np.ndarray, psm: int = 6, oem: int = 3) -> Tuple[str, float]:
+    config = f"--psm {psm} --oem {oem}"
+    pil_img = Image.fromarray(img)
+
+    tokens, confs = _ocr_to_data(pil_img, config=config)
+    text = "\n".join(tokens)
     avg_conf = float(np.mean(confs)) if confs else 0.0
     return text, avg_conf
 
-def best_ocr_from_variants(img: np.ndarray) -> Tuple[str, float, np.ndarray]:
+def _anchor_score(text: str) -> int:
+    if not text:
+        return 0
+    t = text.upper()
+    score = 0
+    for pat in OCR_ANCHORS:
+        if re.search(pat, t):
+            score += 1
+    # Dates/scales are especially useful
+    if normalize_date_to_ymd(t):
+        score += 2
+    if parse_scale(t):
+        score += 1
+    return score
+
+def best_ocr_from_variants(img: np.ndarray, psm: int = 6, oem: int = 3) -> Tuple[str, float, np.ndarray, int]:
+    """
+    Pick the OCR result that looks most “structurally right”:
+      1) more anchors (COUNTRY/STATE/LOCATION/etc.)
+      2) then higher average confidence
+      3) then longer text
+    """
     best_text = ""
     best_conf = -1.0
     best_variant = img
+    best_anchor = -1
+
     for var in preprocess_variants(img):
-        text, conf = ocr_image(var)
-        if conf > best_conf or (conf == best_conf and len(text) > len(best_text)):
-            best_text, best_conf, best_variant = text, conf, var
-    return best_text, best_conf, best_variant
+        text, conf = ocr_image(var, psm=psm, oem=oem)
+        anc = _anchor_score(text)
+
+        if (anc > best_anchor) or (anc == best_anchor and (conf > best_conf)) or (anc == best_anchor and conf == best_conf and len(text) > len(best_text)):
+            best_text, best_conf, best_variant, best_anchor = text, conf, var, anc
+
+    return best_text, best_conf, best_variant, best_anchor
 
 
 # ---------------------------
 # Parsing helpers (COUNTRY/STATE/LOCATION/DATE/SCALE)
 # ---------------------------
+def _looks_like_text(s: str) -> bool:
+    if not s:
+        return False
+    # reject strings that are mostly digits/punct
+    letters = sum(ch.isalpha() for ch in s)
+    return letters >= 2
+
 def parse_country_state_location(lines: List[str]) -> Tuple[str, str, str]:
-    # A) UPPERCASE triple with 2+ spaces
-    for line in lines[:15]:
+    # A) Uppercase triple with 2+ spaces
+    for line in lines[:20]:
         m = UPPER_TRIPLE_SPLIT.match(line.strip())
         if m:
             return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
 
-    # B) Semicolon/comma triplets
-    for line in lines[:20]:
+    # B) Semicolon/comma triplets, but only if all 3 pieces look like real text
+    for line in lines[:30]:
         parts = re.split(r"\s*[;,\t]\s*", line.strip())
         if len(parts) >= 3:
-            a, b, c = parts[0], parts[1], parts[2]
-            # do NOT guess; just return the parts
-            return a.strip(), b.strip(), c.strip()
+            a, b, c = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if _looks_like_text(a) and _looks_like_text(b) and _looks_like_text(c):
+                return a, b, c
 
     # C) Explicit labels
-    blob = "\n".join(lines[:60])
+    blob = "\n".join(lines[:80])
     m = re.search(r"COUNTRY[:\-\s]+([A-Z .,'()&/-]+)", blob, re.I)
     country = m.group(1).strip() if m else ""
     m = re.search(r"STATE[:\-\s]+([A-Z0-9 .,'()&/-]+)", blob, re.I)
@@ -467,7 +575,7 @@ def geocode_latlon(country: str, state: str, location: str, geocode_fn: Optional
 
 
 # ---------------------------
-# Google Drive helpers
+# Google Drive helpers (with retries)
 # ---------------------------
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -490,17 +598,34 @@ def drive_service() -> object:
 
     return build("drive", "v3", credentials=creds)
 
+def _drive_call_with_retry(fn, retries: int = 5, backoff: float = 1.8):
+    last_err: Optional[Exception] = None
+    for i in range(retries):
+        try:
+            return fn()
+        except HttpError as e:
+            last_err = e
+            # 429/5xx are common transient failures
+            time.sleep(backoff ** i)
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff ** i)
+    raise RuntimeError(f"Drive API call failed after {retries} tries: {last_err}")
+
 def drive_list_children(svc: object, folder_id: str) -> List[dict]:
-    """List direct children of a folder (files + subfolders)"""
+    """List direct children of a folder (files + subfolders)."""
     items: List[dict] = []
     page_token = None
     while True:
-        resp = svc.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageToken=page_token,
-            pageSize=1000
-        ).execute()
+        def _call():
+            return svc.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageToken=page_token,
+                pageSize=1000
+            ).execute()
+
+        resp = _drive_call_with_retry(_call)
         items.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -530,28 +655,23 @@ def drive_get_path_map(svc: object, folder_ids: List[str]) -> Dict[str, str]:
 
 def drive_download_file(svc: object, file_id: str, dest_path: Path) -> None:
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    request = svc.files().get_media(fileId=file_id)
-    fh = io.FileIO(str(dest_path), "wb")
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
 
-def is_image_name(name: str) -> bool:
-    ext = Path(name).suffix.lower()
-    return ext in {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp"}
+    def _call_download():
+        request = svc.files().get_media(fileId=file_id)
+        with io.FileIO(str(dest_path), "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return True
+
+    _drive_call_with_retry(_call_download)
 
 
 # ---------------------------
 # Human-in-the-loop review UI (CLI)
 # ---------------------------
 def prompt_field(label: str, current: str, needs_review: bool, allow_hint: str = "") -> str:
-    """
-    Simple interactive prompt:
-    - If needs_review: highlight with '!!'
-    - Press Enter to keep current
-    - Or type new value
-    """
     flag = "!!" if needs_review else "  "
     hint = f" ({allow_hint})" if allow_hint else ""
     print(f"{flag} {label}{hint}: {current!r}")
@@ -604,9 +724,11 @@ def process_one_image(
     microfilm_name: str,
     microfilm_from_folder: bool,
     interactive: bool,
+    psm: int,
+    oem: int,
 ) -> Row:
     img = load_image_cv(str(local_path))
-    ocr_text, conf, best_variant = best_ocr_from_variants(img)
+    ocr_text, conf, best_variant, anchor_score = best_ocr_from_variants(img, psm=psm, oem=oem)
 
     if save_ocr_dir:
         save_ocr_dir.mkdir(parents=True, exist_ok=True)
@@ -639,13 +761,12 @@ def process_one_image(
     # MICROFILM_NAME from folder
     mf_name = microfilm_name
     if microfilm_from_folder:
-        # take top folder name from drive_rel_path if available
         parts = drive_rel_path.split("/")
         if len(parts) > 1:
             mf_name = parts[0].strip() or microfilm_name
 
-    # Basic comments
-    comments = f"avg_conf={conf:.1f}; path={drive_rel_path}"
+    # Comments: keep it simple and actually useful for auditing
+    comments = f"avg_conf={conf:.1f}; anchors={anchor_score}; psm={psm}; path={drive_rel_path}"
 
     row = Row(
         FILE_NAME=drive_rel_path,
@@ -677,11 +798,10 @@ def process_one_image(
         print("-"*72)
 
         if needs_any_review:
-            print("Some fields need review. Quick edit mode:\n")
+            print("Some fields need a look. Quick edit mode:\n")
         else:
-            print("Fields look good. You can still edit if you want:\n")
+            print("Looks fine. Edit anything you want:\n")
 
-        # Prompt core fields (flags drive attention)
         row.COUNTRY = prompt_field("COUNTRY", row.COUNTRY, country_flag, allow_hint="NOAA allow-list")
         row.STATE = prompt_field("STATE", row.STATE, state_flag, allow_hint="NOAA allow-list")
         row.LOCATION = prompt_field("LOCATION", row.LOCATION, location_flag, allow_hint="NOAA allow-list")
@@ -716,12 +836,26 @@ def main() -> None:
     ap.add_argument("--enable-geocode", action="store_true", help="Enable Nominatim geocoding for lat/lon (rate-limited)")
     ap.add_argument("--microfilm-name", default="", help="Default MICROFILM_NAME (if not using --microfilm-name-from-folder)")
     ap.add_argument("--microfilm-name-from-folder", action="store_true", help="Set MICROFILM_NAME from top-level Drive folder name")
+
+    # Quality-of-life for testing and reproducibility
+    ap.add_argument("--max-files", type=int, default=0, help="Process at most N images (0 = no limit)")
+    ap.add_argument("--shuffle", action="store_true", help="Shuffle file processing order")
+    ap.add_argument("--sort", action="store_true", help="Sort file processing order by path")
+
+    # OCR knobs
+    ap.add_argument("--psm", type=int, default=6, help="Tesseract page segmentation mode (default: 6)")
+    ap.add_argument("--oem", type=int, default=3, help="Tesseract OCR engine mode (default: 3)")
+
+    # IOC cache
+    ap.add_argument("--ioc-cache-html", default="./_cache/ioc_list.html", help="Where to cache IOC list HTML")
+
     args = ap.parse_args()
 
     out_xlsx = str(Path(args.out_xlsx))
     cache_dir = Path(args.cache_dir)
     save_ocr_dir = Path(args.save_ocr) if args.save_ocr else None
     log_path = Path(args.log_path)
+    ioc_cache_path = Path(args.ioc_cache_html) if args.ioc_cache_html else None
 
     # Fetch official lists
     print("Fetching NOAA allow-lists (countries/states/locations/regions)...")
@@ -730,12 +864,11 @@ def main() -> None:
 
     print("Fetching IOC station list (LOCATION_SHORT codes)...")
     try:
-        ioc_index = fetch_ioc_station_index()
-        print(f"  IOC index entries={len(ioc_index)}")
+        ioc_index = fetch_ioc_station_index(cache_path=ioc_cache_path)
+        print(f"  IOC index entries={len(ioc_index)} (cache: {ioc_cache_path})")
     except Exception as e:
         print(f"  IOC fetch failed, continuing without IOC codes: {e}")
         ioc_index = {}
-
 
     geocode_fn = make_geocoder(args.enable_geocode)
 
@@ -749,7 +882,15 @@ def main() -> None:
         print("No images found in provided Drive folders.")
         sys.exit(1)
 
-    print(f"Found {len(image_items)} image files.")
+    if args.sort:
+        image_items.sort(key=lambda x: x[1])
+    if args.shuffle:
+        random.shuffle(image_items)
+
+    if args.max_files and args.max_files > 0:
+        image_items = image_items[: args.max_files]
+
+    print(f"Found {len(image_items)} image files to process.")
 
     processed: Set[str] = set()
     if args.resume:
@@ -765,13 +906,15 @@ def main() -> None:
     if not default_microfilm and not args.microfilm_name_from_folder:
         default_microfilm = "UNKNOWN"
 
+    # Make sure output exists early (helps if the run dies mid-way)
+    ensure_excel(out_xlsx)
+
     for i, (file_id, rel_path) in enumerate(image_items, 1):
         if args.resume and file_id in processed:
             skip_count += 1
             continue
 
         try:
-            # Download (cached)
             local_path = cache_dir / rel_path
             if not local_path.exists():
                 print(f"[{i}/{len(image_items)}] Downloading: {rel_path}")
@@ -792,14 +935,22 @@ def main() -> None:
                 microfilm_name=default_microfilm,
                 microfilm_from_folder=args.microfilm_name_from_folder,
                 interactive=args.interactive,
+                psm=args.psm,
+                oem=args.oem,
             )
             rows_to_write.append(row)
             ok_count += 1
 
-            append_log(log_path, {"file_id": file_id, "rel_path": rel_path, "status": "ok"})
+            append_log(log_path, {
+                "file_id": file_id,
+                "rel_path": rel_path,
+                "status": "ok",
+                "psm": args.psm,
+                "oem": args.oem,
+            })
             print(f"  -> OK: {local_path.name}")
 
-            # Write in small batches so you don’t lose work
+            # Write in batches so work is not lost
             if len(rows_to_write) >= 25:
                 append_rows_to_excel(out_xlsx, rows_to_write)
                 rows_to_write = []
@@ -810,7 +961,6 @@ def main() -> None:
             append_log(log_path, {"file_id": file_id, "rel_path": rel_path, "status": "error", "error": str(e)})
             print(f"  -> ERROR: {rel_path} :: {e}")
 
-    # Final flush
     if rows_to_write:
         append_rows_to_excel(out_xlsx, rows_to_write)
 
